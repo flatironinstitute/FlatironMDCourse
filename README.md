@@ -1,2 +1,2 @@
 # FlatironMDCourse
-Flatiron Institute MD Course
+Flatiron Institute MD Course.
