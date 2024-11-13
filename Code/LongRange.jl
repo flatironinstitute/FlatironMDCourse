@@ -7,6 +7,8 @@ using StaticArrays;
 using Random;
 using Distributions;
 using SpecialFunctions;
+using BenchmarkTools;
+using Chairmarks;
 Random.seed!(1234);
 
 # We are going to build out own entire system for MD in the notebook so that we can do whatever we want with it.
@@ -145,11 +147,8 @@ end
     return norm(r) == 0 ? 0.0 : q1 * q2 / norm(r);
 end
 
-# Direct sum energy of all particles in a periodic system up to Nx, Ny, Nz replicas in each direction.
-# Note that we don't have the minimum image here, and construct the lattice vector between the points.
-function CoulombDirectSum(mdsys::MDSystem, unitcell::UnitCell, Nradial::Int64)
-    N = mdsys.N;
-    Epot = Threads.Atomic{Float64}(0.0);
+# Build the real space number of periodic boxes to use
+function BuildPeriodicBoxes(Nradial::Int64)
     # Take a sphere of boxes to compare to the Ewald sum
     nvectors = Vector{SVector{3,Float64}}();
     for mx in -Nradial:Nradial
@@ -161,6 +160,36 @@ function CoulombDirectSum(mdsys::MDSystem, unitcell::UnitCell, Nradial::Int64)
             end
         end
     end
+    return nvectors;
+end
+
+# Direct sum energy of all particles in a periodic system up to Nx, Ny, Nz replicas in each direction.
+# Note that we don't have the minimum image here, and construct the lattice vector between the points.
+function CoulombDirectSumSerial(mdsys::MDSystem, unitcell::UnitCell, Nradial::Int64)
+    N = mdsys.N;
+    Epot = Threads.Atomic{Float64}(0.0);
+    # Take a sphere of boxes to compare to the Ewald sum
+    nvectors = BuildPeriodicBoxes(Nradial);
+     # Thread this loop
+    Threads.@threads for n in nvectors
+        for idx in 1:N
+            for jdx in 1:N
+                r = mdsys.X[jdx] - mdsys.X[idx] + SVector{3,Float64}(n[1]*unitcell.L[1], n[2]*unitcell.L[2], n[3]*unitcell.L[3]);
+                Epot_local = CoulombPotential(r, mdsys.charge[idx], mdsys.charge[jdx]);
+                Threads.atomic_add!(Epot, Epot_local);
+            end
+        end
+    end
+    # Remember to include the factor of 1/2 to avoid double counting! Also get it out of the Atomic version.
+    return 0.5 * Epot[];
+end
+
+# Use atomics to calculate the energy
+function CoulombDirectSumAtomic(mdsys::MDSystem, unitcell::UnitCell, Nradial::Int64)
+    N = mdsys.N;
+    Epot = Threads.Atomic{Float64}(0.0);
+    # Take a sphere of boxes to compare to the Ewald sum
+    nvectors = BuildPeriodicBoxes(Nradial);
      # Thread this loop
     Threads.@threads for n in nvectors
         for idx in 1:N
@@ -178,31 +207,22 @@ end
 # Direct sum energy of all particles in a periodic system using thread local storage and a reduction at the end.
 function CoulombDirectSumReduce(mdsys::MDSystem, unitcell::UnitCell, Nradial::Int64)
     N = mdsys.N;
-    Epot_local = Vector{Float64}(0.0, Threads.nthreads());
+    Epot_local = zeros(Float64, Threads.nthreads());
     # Take a sphere of boxes to compare to the Ewald sum
-    nvectors = Vector{SVector{3,Float64}}();
-    for mx in -Nradial:Nradial
-        for my in -Nradial:Nradial
-            for mz in -Nradial:Nradial
-                if norm(SVector{3,Float64}(mx, my, mz)) <= Nradial
-                    push!(nvectors, SVector{3,Float64}(mx, my, mz));
-                end
-            end
-        end
-    end
+    nvectors = BuildPeriodicBoxes(Nradial);
      # Thread this loop
     Threads.@threads for n in nvectors
         for idx in 1:N
             for jdx in 1:N
                 r = mdsys.X[jdx] - mdsys.X[idx] + SVector{3,Float64}(n[1]*unitcell.L[1], n[2]*unitcell.L[2], n[3]*unitcell.L[3]);
-                # Epot_local = CoulombPotential(r, mdsys.charge[idx], mdsys.charge[jdx]);
-                # Threads.atomic_add!(Epot, Epot_local);
                 Epot_local[Threads.threadid()] += CoulombPotential(r, mdsys.charge[idx], mdsys.charge[jdx]);
             end
         end
     end
-    # Remember to include the factor of 1/2 to avoid double counting! Also get it out of the Atomic version.
-    return 0.5 * Epot[];
+    # Reduce the local energy to the global energy
+    Epot = sum(Epot_local);
+    # Remember to include the factor of 1/2 to avoid double counting!
+    return 0.5 * Epot;
 end
 
 # We will be using Allen for the calculation of the Ewald sum. Frenkel has alpha = = sqrt(alpha_allen)
@@ -212,23 +232,38 @@ end
 end
 
 # Do the short-range part of the Ewald energy calculation
-function EwaldShortRange(mdsys::MDSystem, sqrtalpha::Float64, rcut::Float64)
+function EwaldShortRangeSerial(mdsys::MDSystem, unitcell::UnitCell, sqrtalpha::Float64, rcut::Float64)
     N = mdsys.N;
-    # Epot = 0.0;
-    Epot = Threads.Atomic{Float64}(0.0);
-    # Thread this loop
-    Threads.@threads for idx in 1:N
+    Epot = 0.0;
+    for idx in 1:N
         for jdx in 1:N
             if idx != jdx
-                r = mdsys.X[jdx] - mdsys.X[idx];
+                r = min_image(mdsys.X[jdx] - mdsys.X[idx], unitcell);
                 if norm(r) <= rcut
-                    # Epot += EwaldShortRangePotential(r, mdsys.charge[idx], mdsys.charge[jdx], sqrtalpha);
-                    Epot_local = EwaldShortRangePotential(r, mdsys.charge[idx], mdsys.charge[jdx], sqrtalpha);
-                    Threads.atomic_add!(Epot, Epot_local);
+                    Epot += EwaldShortRangePotential(r, mdsys.charge[idx], mdsys.charge[jdx], sqrtalpha);
                 end
             end
         end
     end
+    return 0.5 * Epot;
+end
+
+# Do the short-range part of the Ewald energy calculation using reductions
+function EwaldShortRangeReduce(mdsys::MDSystem, unitcell::UnitCell, sqrtalpha::Float64, rcut::Float64)
+    N = mdsys.N;
+    Epot_local = zeros(Float64, Threads.nthreads());
+    Threads.@threads for idx in 1:N
+        for jdx in 1:N
+            if idx != jdx
+                r = min_image(mdsys.X[jdx] - mdsys.X[idx], unitcell);
+                if norm(r) <= rcut
+                    Epot_local[Threads.threadid()] += EwaldShortRangePotential(r, mdsys.charge[idx], mdsys.charge[jdx], sqrtalpha);
+                end
+            end
+        end
+    end
+    # Reduce the local energy to the global energy
+    Epot = sum(Epot_local);
     return 0.5 * Epot;
 end
 
@@ -255,7 +290,7 @@ function EwaldKvectors(unitcell::UnitCell, k_cutoff::Float64)
 end
 
 # Long-range Ewald energy
-function EwaldLongRange(mdsys::MDSystem, unitcell::UnitCell, alpha::Float64, kvectors::Vector{SVector{3,Float64}})
+function EwaldLongRangeSerial(mdsys::MDSystem, unitcell::UnitCell, alpha::Float64, kvectors::Vector{SVector{3,Float64}})
     Epot = 0.0;
     for k in kvectors
         # Compute the fourier transform of the charge density
@@ -269,6 +304,23 @@ function EwaldLongRange(mdsys::MDSystem, unitcell::UnitCell, alpha::Float64, kve
     return Epot / (2.0 * unitcell.L[1] * unitcell.L[2] * unitcell.L[3]);
 end
 
+# Long-range Ewald energy with reduction
+function EwaldLongRangeReduce(mdsys::MDSystem, unitcell::UnitCell, alpha::Float64, kvectors::Vector{SVector{3,Float64}})
+    Epot_local = zeros(Float64, Threads.nthreads());
+    Threads.@threads for k in kvectors
+        # Compute the fourier transform of the charge density
+        rho_k = zero(ComplexF64);
+        for idx in 1:mdsys.N
+            rho_k += mdsys.charge[idx] * exp(1im * dot(k, mdsys.X[idx]));
+        end
+        # Now do the energy contribution
+        Epot_local[Threads.threadid()] += (4 * pi) / dot(k,k) * (rho_k' * rho_k) * exp(-dot(k,k) / (4 * alpha));
+    end
+    # Sum the local energies
+    Epot = sum(Epot_local);
+    return Epot / (2.0 * unitcell.L[1] * unitcell.L[2] * unitcell.L[3]);
+end
+
 # Self-correction term in Ewald sum
 function EwaldSelfEnergy(mdsys::MDSystem, alpha::Float64)
     Epot = 0.0;
@@ -278,18 +330,46 @@ function EwaldSelfEnergy(mdsys::MDSystem, alpha::Float64)
     return Epot;
 end
 
+# Ewald boundary correction term
+function EwaldBoundaryEnergy(mdsys::MDSystem, unitcell::UnitCell, epsilonprime::Float64)
+    rqi = SVector{3,Float64}(0.0, 0.0, 0.0);
+    for idx in 1:mdsys.N
+        rqi += mdsys.charge[idx] * mdsys.X[idx];
+    end
+    V = unitcell.L[1] * unitcell.L[2] * unitcell.L[3];
+    return 2 * pi / ((2 * epsilonprime + 1)*V) * dot(rqi, rqi);
+end
+
 # Combined short-range and long-range portions of the Ewald summation with correction term
-function EwaldSum(mdsys::MDSystem, unitcell::UnitCell, alpha::Float64, rcut::Float64, Nk::Int64)
+function EwaldSumSerial(mdsys::MDSystem, unitcell::UnitCell, alpha::Float64, rcut::Float64, Nk::Int64)
     # Convert to sqrt(alpha) for the short-range portion
     sqrtalpha = sqrt(alpha);
     # Calculate the short-range portion of the Ewald sum
-    Eshort = EwaldShortRange(mdsys, sqrtalpha, rcut);
+    Eshort = EwaldShortRangeSerial(mdsys, unitcell, sqrtalpha, rcut);
     # Calculate the long-range portion of the Ewald sum
     kvectors = EwaldKvectors(unitcell, 2.0 * pi / unitcell.L[1] * Nk);
-    Elong = EwaldLongRange(mdsys, unitcell, alpha, kvectors);
+    Elong = EwaldLongRangeSerial(mdsys, unitcell, alpha, kvectors);
     # Calculate the self-energy correction term
     Eself = EwaldSelfEnergy(mdsys, alpha);
-    return Eshort + Elong - Eself;
+    # Calculate the boundary term
+    Eboundary = EwaldBoundaryEnergy(mdsys, unitcell, 1.0);
+    return Eshort + Elong + Eboundary - Eself;
+end
+
+# Threaded reduction version of the Ewald sum
+function EwaldSumReduce(mdsys::MDSystem, unitcell::UnitCell, alpha::Float64, rcut::Float64, Nk::Int64)
+    # Convert to sqrt(alpha) for the short-range portion
+    sqrtalpha = sqrt(alpha);
+    # Calculate the short-range portion of the Ewald sum
+    Eshort = EwaldShortRangeReduce(mdsys, unitcell, sqrtalpha, rcut);
+    # Calculate the long-range portion of the Ewald sum
+    kvectors = EwaldKvectors(unitcell, 2.0 * pi / unitcell.L[1] * Nk);
+    Elong = EwaldLongRangeReduce(mdsys, unitcell, alpha, kvectors);
+    # Calculate the self-energy correction term
+    Eself = EwaldSelfEnergy(mdsys, alpha);
+    # Calculate the boundary term
+    Eboundary = EwaldBoundaryEnergy(mdsys, unitcell, 1.0);
+    return Eshort + Elong + Eboundary - Eself;
 end
 
 # Compute the error in the Ewald sum
@@ -321,25 +401,41 @@ ThermalizeMomenta!(mdsys, kT);
 println("Using NThreads = $(Threads.nthreads())");
 
 # Various periodic configurations of the box
-Nradial_max = 30+1;
+Nradial_max = 60;
 E_direct = zeros(Nradial_max);
+E_directatomic = zeros(Nradial_max);
+E_directreduce = zeros(Nradial_max);
 Nbox_direct = zeros(Nradial_max);
 
 println("Direct Coulomb calculation");
-for iradial = 1:Nradial_max
-    nradial = iradial - 1;
-    Nbox_direct[iradial] = nradial;
-    println("  nradial = $nradial");
-    E_direct[iradial] = CoulombDirectSum(mdsys, unitcell, nradial);
+for iradial = 10:10:Nradial_max
+    Nbox_direct[iradial] = iradial;
+    println("  iradial = $iradial");
+    # E_direct[iradial] = CoulombDirectSumSerial(mdsys, unitcell, nradial);
+    # E_directatomic[iradial] = CoulombDirectSumAtomic(mdsys, unitcell, nradial);
+    E_directreduce[iradial] = CoulombDirectSumReduce(mdsys, unitcell, iradial);
 end
+# Test the timing of the different direct sum threading levels
+# println("Testing Coulomb direct sum speeds");
+# for iradial = 1:Nradial_max
+#     nradial = iradial - 1;
+#     println("DirectSum nradial = $nradial");
+#     @btime CoulombDirectSum($mdsys, $unitcell, $nradial)
+# end
+# Quick and dirty benchmarking
+# @b CoulombDirectSum(mdsys, unitcell, 10)
+# @b CoulombDirectSumAtomic(mdsys, unitcell, 10)
+# @b CoulombDirectSumReduce(mdsys, unitcell, 10)
+
 # plot(Nbox_direct, E_direct, label="Periodic Box Energy", xlabel="Number of Periodic Images", ylabel="Energy", legend=:topleft)
 
 # Now do all of the Ewald sum information
 # What do each of the individual portions look like?
-# alpha_vec = 0:0.1:2.0;
-alpha_vec = 0:0.1:1.0;
+alpha_vec = 0:0.1:2.0;
+# alpha_vec = 0:0.1:1.0;
 s = 3.0;
-E_Ewald = zeros(length(alpha_vec));
+E_Ewaldserial = zeros(length(alpha_vec));
+E_Ewaldreduce = zeros(length(alpha_vec));
 dE_short = zeros(length(alpha_vec));
 dE_long = zeros(length(alpha_vec));
 dE_total = zeros(length(alpha_vec));
@@ -348,12 +444,12 @@ for ialpha in eachindex(alpha_vec)
     # For a given choice of alpha and the scale parameter, we can compute the cutoff radius and how many
     # terms in k-space we need to include.
     rcut = s / alpha;
-    Nk = ceil(Int64, s * unitcell.L[1] * alpha / pi);
+    Nk = 2*ceil(Int64, s * unitcell.L[1] * alpha / pi);
     println("alpha = $alpha, rcut = $rcut, Nk = $Nk");
-    kvectors = EwaldKvectors(unitcell, 2.0 * pi / unitcell.L[1] * Nk);
 
     # Entire Ewald sum
-    E_Ewald[ialpha] = EwaldSum(mdsys, unitcell, alpha, rcut, Nk);
+    # E_Ewaldserial[ialpha] = EwaldSumSerial(mdsys, unitcell, alpha, rcut, Nk);
+    E_Ewaldreduce[ialpha] = EwaldSumReduce(mdsys, unitcell, alpha, rcut, Nk);
 
     # What the error should be in the terms of the Ewald sum
     dE_short[ialpha], dE_long[ialpha] = EwaldError(mdsys, unitcell, s, alpha);
@@ -361,7 +457,7 @@ for ialpha in eachindex(alpha_vec)
 end
 
 # Calculate the difference between using a lot of periodic images and the Ewald sum
-E_diff = E_Ewald .- E_direct[end]
+# E_diff = E_Ewald .- E_directreduce[end]
 
 # NOTE: Something is wrong that is giving a very slight systematic error for different values
 # of alpha. I'm not sure what it is, but it is very small.
